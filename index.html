@@ -4628,7 +4628,7 @@ html, body{
 // KONFIGURASI APLIKASI
 // =====================================================
 // GANTI URL INI DENGAN URL WEB APP ANDA (Pastikan diakhiri dengan /exec)
-const GAS_URL = 'https://script.google.com/macros/s/AKfycbxdXB_uaypyskd8QjPDzniCFRSffhGXc9H5ti6-UKumuI3GVd6Ytw7u9D6dIwhTvYpZ/exec'; 
+const GAS_URL = 'https://script.google.com/macros/s/AKfycbxoivQ2189DjgYgvQSYmTiwr-21bJ3E1S2cB1phL3Qh2FddEb3wUMnUdXbMkMrfk0-3/exec'; 
 
 // MASUKKAN ID FOLDER GOOGLE DRIVE UNTUK MENYIMPAN GAMBAR PRODUK
 // Cara dapat ID: Buka folder di Google Drive, lihat URL. ID adalah bagian setelah `/folders/`
@@ -5858,14 +5858,6 @@ function navigate(page, salesTypeFilter = '') {
     setTimeout(() => { initQRCode(); updateQRCode(); fetchProductsFromGAS(); renderCategoryOptions(); }, 0);
   }
   if (page === 'penjualan') {
-    // Render produk yang sudah tersedia SEGERA.
-    // Tidak menunggu request Spreadsheet selesai.
-    if (products && products.length) {
-      updateOrderProductFilters();
-      renderOrderProducts();
-    }
-
-    // Sinkronisasi data terbaru tetap berjalan di background.
     fetchProductsFromGAS().then(() => {
       updateOrderProductFilters();
 
@@ -6384,14 +6376,6 @@ document.getElementById('productForm').addEventListener('submit', async (e) => {
     }
 
     if (isEditing) {
-      // POST Apps Script memakai no-cors, sehingga browser tidak dapat
-      // membaca response POST. Tunggu sampai data benar-benar terbaca
-      // kembali dari Spreadsheet agar URL_GAMBAR baru tidak kalah race
-      // dengan request refresh katalog.
-      if (typeof waitForProductUpdate === 'function') {
-        await waitForProductUpdate(editingId, imageChanged, originalImageValue);
-      }
-
       const idx = products.findIndex(p => String(p.id) === String(editingId));
       if (idx > -1) {
         products[idx] = {
@@ -6450,55 +6434,6 @@ document.getElementById('productForm').addEventListener('submit', async (e) => {
     submitBtn.disabled = false;
   }
 });
-
-async function waitForProductUpdate(productId, changeState, oldImageValue) {
-  if (!productId || !GAS_URL) return null;
-
-  const separator = GAS_URL.includes('?') ? '&' : '?';
-  const endpoint = `${GAS_URL}${separator}action=get&id=${encodeURIComponent(productId)}`;
-
-  const maxAttempts = 8;
-  const intervalMs = 500;
-
-  for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    try {
-      const json = await appFetchJSON(endpoint, { cache: 'no-store' }, 0);
-      const item = json?.data;
-
-      if (json?.success && item) {
-        const currentImage = String(item.URL_GAMBAR || '');
-
-        // Foto baru: URL Drive harus berubah dan bukan Base64.
-        if (changeState === true) {
-          if (
-            currentImage &&
-            !currentImage.startsWith('data:image/') &&
-            currentImage !== String(oldImageValue || '')
-          ) {
-            return item;
-          }
-        }
-
-        // Foto dihapus: kolom URL_GAMBAR harus kosong.
-        if (changeState === 'remove' && currentImage === '') {
-          return item;
-        }
-
-        // Data non-foto tetap dianggap berhasil jika field utama sudah sama.
-        if (changeState !== true && changeState !== 'remove') {
-          return item;
-        }
-      }
-    } catch (err) {
-      // Coba lagi karena Apps Script dapat selesai sedikit setelah POST.
-    }
-
-    await new Promise(resolve => setTimeout(resolve, intervalMs));
-  }
-
-  // Jangan menggagalkan update hanya karena polling timeout.
-  return null;
-}
 
 function editGASProduct(index) {
   const p = gasProducts[index];
@@ -6617,73 +6552,53 @@ async function viewQRByProduct(productId, sku){
 // ==================================================
 let productsFetchPromise = null;
 let lastProductsFetchAt = 0;
-// Cache UI hanya dipakai sebagai tampilan instan.
-// Data Spreadsheet tetap disinkronkan di background.
-const PRODUCTS_CACHE_TTL = 5000;
-
-function renderProductsInstantly() {
-  if (!products || !products.length) return;
-
-  gasProducts = sortNewestProductsFirst(products);
-  updateProductTableCategoryFilter(gasProducts);
-  updateProductTableSalesTypeFilter(gasProducts);
-
-  const tableBody = document.getElementById('gasProductsTableBody');
-  if (tableBody) filterGASProductsTable();
-
-  updateOrderProductFilters();
-  const orderList = document.getElementById('orderProductList');
-  if (orderList) renderOrderProducts();
-}
-
-function startProductsBackgroundRefresh() {
-  if (productsFetchPromise) return productsFetchPromise;
-
-  productsFetchPromise = fetchProductsFromGASDirect()
-    .then(result => {
-      lastProductsFetchAt = Date.now();
-      return result;
-    })
-    .catch(err => {
-      console.warn('Sinkronisasi katalog background gagal:', err);
-      return products;
-    })
-    .finally(() => {
-      productsFetchPromise = null;
-    });
-
-  return productsFetchPromise;
-}
+const PRODUCTS_CACHE_TTL = 45000;
 
 async function fetchProductsFromGAS(forceRefresh = false) {
-  // Jika katalog sudah tersedia, TAMPILKAN SEKARANG.
-  // Jangan menunggu Apps Script hanya untuk membuka menu.
-  if (!forceRefresh && products.length) {
-    renderProductsInstantly();
+  // Request yang sedang berjalan dipakai bersama agar beberapa menu tidak
+  // menembak Apps Script secara bersamaan.
+  if (productsFetchPromise) {
+    if (!forceRefresh && products.length) return products;
+    return productsFetchPromise;
+  }
 
-    // Tetap ambil data terbaru dari Spreadsheet di background.
-    if (Date.now() - lastProductsFetchAt >= PRODUCTS_CACHE_TTL) {
-      startProductsBackgroundRefresh();
-    }
-
+  if (!forceRefresh && products.length && (Date.now() - lastProductsFetchAt < PRODUCTS_CACHE_TTL)) {
     return products;
   }
 
-  // Jika cache browser tersedia tetapi variabel products masih kosong,
-  // tampilkan cache sekarang lalu sinkronkan ke Spreadsheet.
+  // Gunakan cache sesi sebagai respons instan saat membuka menu.
+  // Sinkronisasi server tetap berjalan di background.
   if (!forceRefresh) {
+    // Jendela instant-render diperpanjang menjadi 24 jam karena baris di
+    // bawah SELALU menjalankan sinkronisasi ke Apps Script segera setelah
+    // ini. Pada koneksi lambat, katalog kemarin tampil instan sambil
+    // menunggu data terbaru, jauh lebih baik daripada layar kosong.
     const sessionProducts = getProductsSessionCache(24 * 60 * 60 * 1000);
     if (sessionProducts && sessionProducts.length) {
       products = sessionProducts;
-      gasProducts = sortNewestProductsFirst(sessionProducts);
-      renderProductsInstantly();
+      gasProducts = sessionProducts;
+      updateProductTableCategoryFilter(gasProducts);
+      updateProductTableSalesTypeFilter(gasProducts);
+      const tableBody = document.getElementById('gasProductsTableBody');
+      if (tableBody) filterGASProductsTable();
 
-      startProductsBackgroundRefresh();
+      productsFetchPromise = fetchProductsFromGASDirect()
+        .then(result => { lastProductsFetchAt = Date.now(); return result; })
+        .catch(err => {
+          console.warn('Sinkronisasi katalog background gagal:', err);
+          return products;
+        })
+        .finally(() => { productsFetchPromise = null; });
+
       return products;
     }
   }
 
-  return startProductsBackgroundRefresh();
+  productsFetchPromise = fetchProductsFromGASDirect()
+    .then(result => { lastProductsFetchAt = Date.now(); return result; })
+    .finally(() => { productsFetchPromise = null; });
+
+  return productsFetchPromise;
 }
 
 async function fetchProductsFromGASDirect() {
@@ -6712,9 +6627,7 @@ async function fetchProductsFromGASDirect() {
     }
   }
 
-  // Spinner hanya ditampilkan jika belum ada data sama sekali.
-  // Saat sinkronisasi background, tabel lama tetap terlihat tanpa berkedip.
-  if (tableBody && (!products || !products.length)) {
+  if (tableBody) {
     tableBody.innerHTML = `<tr><td colspan="8" class="text-center text-muted py-4"><span class="spinner-border spinner-border-sm me-2"></span>Memuat data dari Spreadsheet...</td></tr>`;
   }
 
@@ -7580,19 +7493,6 @@ function closeSalesCartPanel() {
 document.addEventListener('DOMContentLoaded', function() {
   initSalesCartPopup();
   updateSalesCartVisibility();
-
-  // PRELOAD KATALOG PRODUK:
-  // Ambil data Spreadsheet sejak aplikasi selesai memuat DOM.
-  // Dengan begitu menu INPUT PRODUK dan PENJUALAN tidak perlu menunggu
-  // request pertama ketika menu dibuka.
-  setTimeout(() => {
-    try {
-      warmUpBackend();
-      fetchProductsFromGAS();
-    } catch (err) {
-      console.warn('Preload katalog gagal:', err);
-    }
-  }, 0);
 });
 
 function handleCartDiscountInput(input) {
